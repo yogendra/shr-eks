@@ -1,0 +1,12 @@
+.envrc-private
+demo.env
+config/yb-platform-ca.crt
+config/yugabyte-*-secret.yml
+.kubeconfig
+config/*sshkey*
+.terraform/
+terraform.tfstate
+terraform.tfstate.backup
+terraform.tfvars
+private/
+.terraform.tfstate.lock.info

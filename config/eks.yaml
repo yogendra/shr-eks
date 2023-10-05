@@ -1,0 +1,142 @@
+---
+apiVersion: eksctl.io/v1alpha5
+kind: ClusterConfig
+
+metadata:
+  name: $PROJECT_NAME
+  region: $AWS_REGION
+  version: "1.27"
+  tags:
+    yb_owner: $PROJECT_USER
+    yb_dept: sales
+    yb_env: demo
+    yb_task: demo
+    yb_project: $PROJECT_NAME
+
+
+vpc:
+  id: $AWS_VPC_ID
+  subnets:
+    private:
+      $AWS_AZ1:
+        id: $AWS_AZ1_SUBNET
+
+      $AWS_AZ2:
+        id: $AWS_AZ2_SUBNET
+
+      $AWS_AZ3:
+        id: $AWS_AZ3_SUBNET
+
+addons:
+  - name: aws-ebs-csi-driver
+    version: latest
+    wellKnownPolicies:
+      ebsCSIController: true
+  - name: coredns
+    version: latest
+  - name: kube-proxy
+    version: latest
+  - name: vpc-cni
+    attachPolicyARNs:
+    - arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy
+
+managedNodeGroups:
+  - name: $PROJECT_NAME-wkr-1
+    availabilityZones: [$AWS_AZ2]
+    instanceType: $AWS_WORKER_TYPE
+    minSize: 0
+    maxSize: 3
+    desiredCapacity: 1
+    volumeSize: 100
+    privateNetworking: true
+    spot: true
+    ssh:
+      enableSSM: true
+      publicKeyName: $AWS_KEYPAIR_NAME
+    securityGroups:
+      attachIDs:
+      - $AWS_SECURITYGROUP
+    labels:
+      roles: worker
+    tags:
+      nodegroup-role: worker
+      yb_owner: $PROJECT_USER
+      yb_dept: sales
+      yb_task: demo
+      yb_env: demo
+      yb_project: $PROJECT_NAME
+    # iam:
+    #   withAddonPolicies:
+    #     autoScaler: true
+    #     externalDNS: true
+    #     certManager: true
+    #     ebs: true
+    #     efs: true
+    #     awsLoadBalancerController: true
+    #     cloudWatch: true
+  - name: $PROJECT_NAME-wkr-2
+    availabilityZones: [$AWS_AZ2]
+    instanceType: $AWS_WORKER_TYPE
+    minSize: 0
+    maxSize: 3
+    desiredCapacity: 1
+    volumeSize: 100
+    privateNetworking: true
+    spot: true
+    ssh:
+      enableSSM: true
+      publicKeyName: $AWS_KEYPAIR_NAME
+    securityGroups:
+      attachIDs:
+      - $AWS_SECURITYGROUP
+    labels:
+      roles: worker
+    tags:
+      nodegroup-role: worker
+      yb_owner: $PROJECT_USER
+      yb_dept: sales
+      yb_task: demo
+      yb_env: demo
+      yb_project: $PROJECT_NAME
+    # iam:
+    #   withAddonPolicies:
+    #     autoScaler: true
+    #     externalDNS: true
+    #     certManager: true
+    #     ebs: true
+    #     efs: true
+    #     awsLoadBalancerController: true
+    #     cloudWatch: true
+  - name: $PROJECT_NAME-wkr-3
+    availabilityZones: [$AWS_AZ3]
+    instanceType: $AWS_WORKER_TYPE
+    minSize: 0
+    maxSize: 3
+    desiredCapacity: 1
+    volumeSize: 100
+    privateNetworking: true
+    spot: true
+    ssh:
+      enableSSM: true
+      publicKeyName: $AWS_KEYPAIR_NAME
+    securityGroups:
+      attachIDs:
+      - $AWS_SECURITYGROUP
+    labels:
+      roles: worker
+    tags:
+      nodegroup-role: worker
+      yb_owner: $PROJECT_USER
+      yb_dept: sales
+      yb_task: demo
+      yb_env: demo
+      yb_project: $PROJECT_NAME
+    # iam:
+    #   withAddonPolicies:
+    #     autoScaler: true
+    #     externalDNS: true
+    #     certManager: true
+    #     ebs: true
+    #     efs: true
+    #     awsLoadBalancerController: true
+    #     cloudWatch: true

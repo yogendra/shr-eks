@@ -1,0 +1,909 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+export SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
+export SCRIPT=${BASH_SOURCE[0]}
+source $SCRIPT_DIR/common-functions.sh
+
+export PROJECT_DIR=${PROJECT_DIR:-$(cd $SCRIPT_DIR/..; pwd)}
+export PROJECT_CONFIG_DIR=${PROJECT_CONFIG_DIR:-$(cd $PROJECT_DIR/config; pwd)}
+export PROJECT_ENV_FILE=${PROJECT_ENV_FILE:-$PROJECT_CONFIG_DIR/demo.env}
+touch $PROJECT_ENV_FILE
+source $PROJECT_ENV_FILE
+
+export PROJECT_NAME=${PROJECT_NAME?"Project Name not set"}
+export AWS_HOSTEDZONE_ID=${AWS_HOSTEDZONE_ID?"must be set in config file"}
+export AWS_HOSTEDZONE_ROOT_DOMAIN=${AWS_HOSTEDZONE_ROOT_DOMAIN:-$(aws route53  get-hosted-zone --id $AWS_HOSTEDZONE_ID --query "HostedZone.Name" --output text | sed 's/\.$//')}
+
+
+export PROJECT_USER=${PROJECT_USER:-$USER}
+export AWS_COMMON_TAGS=${AWS_COMMON_TAGS:-"Key=yb_owner,Value='$PROJECT_USER' Key=yb_dept,Value=sales Key=yb_project,Value='$PROJECT_NAME' Key=yb_env,Value=demo Key=yb_task,Value=demo"}
+export PROJECT_DOMAIN=${PROJECT_DOMAIN:-$PROJECT_NAME.$AWS_HOSTEDZONE_ROOT_DOMAIN}
+export K8S_CLUSTER_CONFIG=${K8S_CLUSTER_CONFIG:-$PROJECT_CONFIG_DIR/eks.yaml}
+export INGRESS_NGINX_HELM_VALUES=${INGRESS_NGINX_HELM_VALUES:-$PROJECT_CONFIG_DIR/ingress-nginx-values.yaml}
+export CERT_MANAGER_CONFIG=${CERT_MANAGER_CONFIG:-$PROJECT_CONFIG_DIR/certs.yaml}
+export YBA_HELM_VALUES=${YBA_HELM_VALUES:-$PROJECT_CONFIG_DIR/yugaware-values.yaml}
+export YBA_LICENSE=${YB_LICENSE:-$PROJECT_CONFIG_DIR/yugabyte-*-secret.yml}
+export YBA_LICENSE_VALUE=$(jq -Rs < $YBA_LICENSE)
+
+export YBA_K8S_STORAGECLASS=${YBA_K8S_STORAGECLASS:-gp3}
+
+export YBA_NS=${YBA_NS:-yb-platform}
+
+export YBA_HELM_RELEASE=${YBA_HELM_RELEASE:-yba}
+
+export YBA_HOSTNAME=${YBA_HOSTNAME:-yba.$PROJECT_DOMAIN}
+export YBA_PROM_HOSTNAME=${YBA_PROM_HOSTNAME:-yba-prom.$PROJECT_DOMAIN}
+export YBA_PORTAL=https://$YBA_HOSTNAME
+export YBA_API=$YBA_PORTAL/api/v1
+export YBA_USERNAME=${YBA_USERNAME:-superadmin@yugabyte.com}
+export YBA_PASSWORD=${YBA_PASSWORD:-Password#123}
+export YBA_BACKUP_BUCKET=${YBA_BACKUP_BUCKET:-yugabyte-apj-demo-backup}
+export YBA_VERSION=${YBA_VERSION:-2.18.2.1-b1}
+export YBA_HELM_VERSION=${YBA_HELM_VERSION:-2.18.2+1}
+export YBA_K8S_PROVIDER_NAME=${YBA_K8S_PROVIDER_NAME:-$PROJECT_NAME}
+
+export AWS_REGION=${AWS_REGION:-$(aws configure get region)}
+export AWS_VPC_ID=${AWS_VPC_ID:-$(aws ec2 --region $AWS_REGION describe-vpcs --query 'Vpcs[?IsDefault==`true`].VpcId' --output text)}
+export AWS_AZ1=${AWS_AZ1:-$(aws ec2 --region $AWS_REGION describe-availability-zones --query 'AvailabilityZones[0].ZoneName' --output text)}
+export AWS_AZ1_SUBNET=${AWS_AZ1_SUBNET:-$(aws ec2 --region $AWS_REGION describe-subnets --query "Subnets[?AvailabilityZone==\`$AWS_AZ1\` && MapPublicIpOnLaunch==\`false\` && VpcId==\`$AWS_VPC_ID\`].SubnetId|[0]" --output text)}
+export AWS_AZ2=${AWS_AZ2:-$(aws ec2 --region $AWS_REGION describe-availability-zones --query 'AvailabilityZones[1].ZoneName' --output text)}
+export AWS_AZ2_SUBNET=${AWS_AZ2_SUBNET:-$(aws ec2 --region $AWS_REGION describe-subnets --query "Subnets[?AvailabilityZone==\`$AWS_AZ2\` && MapPublicIpOnLaunch==\`false\` && VpcId==\`$AWS_VPC_ID\`].SubnetId|[0]" --output text)}
+export AWS_AZ3=${AWS_AZ3:-$(aws ec2 --region $AWS_REGION describe-availability-zones --query 'AvailabilityZones[2].ZoneName' --output text)}
+export AWS_AZ3_SUBNET=${AWS_AZ3_SUBNET:-$(aws ec2 --region $AWS_REGION describe-subnets --query "Subnets[?AvailabilityZone==\`$AWS_AZ3\` && MapPublicIpOnLaunch==\`false\` && VpcId==\`$AWS_VPC_ID\`].SubnetId|[0]" --output text)}
+export AWS_SECURITYGROUP=${AWS_SECURITYGROUP:-$(aws ec2 --region $AWS_REGION describe-security-groups --query "SecurityGroups[?VpcId==\`$AWS_VPC_ID\` && GroupName==\`default\`].GroupId" --output text)}
+export AWS_WORKER_TYPE=${AWS_WORKER_TYPE:-m7a.2xlarge}
+export AWS_KEYPAIR_NAME=${AWS_KEYPAIR_NAME:-$PROJECT_NAME}
+
+function infra-validate(){
+
+  banner Validate Infra
+  log "Validate AWS Region         : $AWS_REGION"
+  [[ $(aws ec2 --no-paginate describe-regions --query "length(Regions[?RegionName==\`$AWS_REGION\`])" --output text) == "1" ]] || (log Failed: $AWS_REGION ; exit 1)
+
+  log "Validate AWS VPC            : $AWS_VPC_ID"
+  [[ $(aws ec2 --no-paginate --region $AWS_REGION describe-vpcs --query "length(Vpcs[?VpcId==\`$AWS_VPC_ID\`])" --output text ) == "1" ]] || (log Failed: $AWS_VPC_ID; exit 1)
+
+  log "Validate AWS Security Group : $AWS_SECURITYGROUP"
+  [[ $(aws ec2 --no-paginate --region $AWS_REGION describe-security-groups --query "length(SecurityGroups[?VpcId==\`$AWS_VPC_ID\` && GroupId==\`$AWS_SECURITYGROUP\`])" --output text ) == "1" ]] || (log Failed: $AWS_SECURITYGROUP; exit 1)
+
+  log "Validate AWS AZ1            : $AWS_AZ1"
+  [[ $(aws ec2 --no-paginate --region $AWS_REGION describe-availability-zones --query "length(AvailabilityZones[?ZoneName==\`$AWS_AZ1\`])" --output text) == "1" ]] || (log Failed: $AWS_AZ1; exit 1)
+
+  log "Validate AWS AZ1 Subnet     : $AWS_AZ1_SUBNET"
+  [[ $(aws ec2 --no-paginate --region $AWS_REGION describe-subnets --query "length(Subnets[?SubnetId==\`$AWS_AZ1_SUBNET\` && AvailabilityZone==\`$AWS_AZ1\` && VpcId==\`$AWS_VPC_ID\`])") == "1" ]] || (log Failed:  $AWS_AZ1_SUBNET; exit 1)
+
+  log "Validate AWS AZ2            : $AWS_AZ2"
+  [[ $(aws ec2 --no-paginate --region $AWS_REGION describe-availability-zones --query "length(AvailabilityZones[?ZoneName==\`$AWS_AZ2\`])" --output text) == "1" ]] || (log Failed: $AWS_AZ2; exit 1)
+
+  log "Validate AWS AZ2 Subnet     : $AWS_AZ2_SUBNET"
+  [[ $(aws ec2 --no-paginate --region $AWS_REGION describe-subnets --query "length(Subnets[?SubnetId==\`$AWS_AZ2_SUBNET\` && AvailabilityZone==\`$AWS_AZ2\` && VpcId==\`$AWS_VPC_ID\`])") == "1" ]] || (log Failed:  $AWS_AZ2_SUBNET; exit 1)
+
+  log "Validate AWS AZ3            : $AWS_AZ3"
+  [[ $(aws ec2 --no-paginate --region $AWS_REGION describe-availability-zones --query "length(AvailabilityZones[?ZoneName==\`$AWS_AZ3\`])" --output text) == "1" ]] || (log Failed: $AWS_AZ3; exit 1)
+
+
+  log "Validate AWS AZ3 Subnet     : $AWS_AZ3_SUBNET"
+  [[ $(aws ec2 --no-paginate --region $AWS_REGION describe-subnets --query "length(Subnets[?SubnetId==\`$AWS_AZ3_SUBNET\` && AvailabilityZone==\`$AWS_AZ3\` && VpcId==\`$AWS_VPC_ID\`])") == "1" ]] || (log Failed:  $AWS_AZ3_SUBNET; exit 1)
+
+  log "Validate AWS Key Pair       : $AWS_KEYPAIR_NAME"
+  [[ $(aws ec2 --no-paginate --region $AWS_REGION describe-key-pairs --query "length(KeyPairs[?KeyName==\`$PROJECT_NAME\`])" --output text) == "1" ]] || log Not Found. Will be created
+
+}
+function _env(){
+  env | grep -E '^(AWS_|PROJECT_|YBA_)' | grep -vE '(AWS_SECRET_ACCESS_KEY|AWS_SESSION_TOKEN|AWS_CREDENTIAL_EXPIRATION)' | sort
+}
+function _env-export(){
+  _env | sed 's/^/export /'
+  # _env
+}
+
+function yba-login(){
+  YBA_AUTH_TOKEN=$(curl $YBA_API/login \
+      -ksSL \
+      -H content-type:application/json \
+      -X POST \
+      -d "{\"emai\":\"$YBA_USERNAME\",\"passwor\":\"$YBA_PASSWOR\" }" \
+      | jq -r '.authToken'
+  )
+  SESSION_INFO_RESPONSE_JSON=$(curl $YBA_API/session_info
+    -ksSL \
+    -H content-type:application/json \
+    -H "X-AUTH-TOKEN:$YBA_AUTH_TOKEN"
+  )
+  export YBA_API=$YBA_API
+  export YBA_API_TOKEN=$(echo $SESSION_INFO_RESPONSE_JSON | jq -rcM '.apiToken')
+  export YBA_CUSTOMER_UUID=$(echo $SESSION_INFO_RESPONSE_JSON | jq -rcM '.customerUUID')
+  export YBA_USER_UUID=$(echo $SESSION_INFO_RESPONSE_JSON | jq -rcM '.userUUID')
+  export YBA_AUTH_HEADER=X-AUTH-YW-API-TOKEN:$YBA_API_TOKEN
+}
+
+function start(){
+  banner "Start Demo"
+  infra-setup
+  yugabyte-setup
+}
+function stop(){
+  banner "Stop Demo"
+  set +e
+  yugabyte-destroy
+  infra-destroy
+}
+function infra-setup(){
+  infra-validate
+  security-setup
+  k8s-setup
+}
+function infra-destroy(){
+  k8s-destroy
+  security-destroy
+}
+function yugabyte-setup(){
+  yba-setup
+  yba-db-create
+}
+
+function yugabyte-destroy(){
+  yba-db-delete
+  yba-destroy
+}
+
+function configure(){
+  banner Cache config
+  set-config AWS_HOSTEDZONE_ROOT_DOMAIN $AWS_HOSTEDZONE_ROOT_DOMAIN
+  set-config AWS_REGION $AWS_REGION
+  set-config AWS_VPC_ID $AWS_VPC_ID
+  set-config AWS_AZ1 $AWS_AZ1
+  set-config AWS_AZ1_SUBNET $AWS_AZ1_SUBNET
+  set-config AWS_AZ2 $AWS_AZ2
+  set-config AWS_AZ2_SUBNET $AWS_AZ2_SUBNET
+  set-config AWS_AZ3 $AWS_AZ3
+  set-config AWS_AZ3_SUBNET $AWS_AZ3_SUBNET
+  set-config AWS_SECURITYGROUP $AWS_SECURITYGROUP
+}
+function deconfigure(){
+  banner Clean Cache config
+  unset-config AWS_HOSTEDZONE_ROOT_DOMAIN
+  unset-config AWS_REGION
+  unset-config AWS_VPC_ID
+  unset-config AWS_AZ1
+  unset-config AWS_AZ1_SUBNET
+  unset-config AWS_AZ2
+  unset-config AWS_AZ2_SUBNET
+  unset-config AWS_AZ3
+  unset-config AWS_AZ3_SUBNET
+  unset-config AWS_SECURITYGROUP
+}
+function security-setup(){
+
+  banner "Configure Security"
+
+  if [[ "0" == $(aws iam list-policies --scope Local --query "length(Policies[?PolicyName==\`$PROJECT_NAME-YBA-Policy\`])") ]] ; then
+    log "Create policy[$PROJECT_NAME-YBA-Policy]"
+    aws iam create-policy --no-paginate --policy-name $PROJECT_NAME-YBA-Policy --tags $AWS_COMMON_TAGS Key=yb_name,Value=$PROJECT_NAME-YBA-Policy --policy-document file://$PROJECT_CONFIG_DIR/yba-user-policy.json --query="Policy.Arn" --output text
+  fi
+
+  log Setup AWS User
+  if [[ "0" == $(aws iam list-users --query "length(Users[?UserName==\`$PROJECT_NAME-SA\`])") ]]; then
+    log "Create user[$PROJECT_NAME-SA]"
+    aws iam create-user --no-paginate --user-name $PROJECT_NAME-SA --tags $AWS_COMMON_TAGS Key=yb_name,Value=$PROJECT_NAME-SA --query "User.Arn" --output text
+  fi
+
+  log Setup AWS User Policy
+  YBA_IAM_POLICY_ARN=$(aws iam list-policies --scope Local --query "Policies[?PolicyName==\`$PROJECT_NAME-YBA-Policy\`].Arn|[0]" --output text)
+  aws iam attach-user-policy --no-paginate --user-name $PROJECT_NAME-SA --policy-arn $YBA_IAM_POLICY_ARN
+
+  log Setup Access Keys
+  if [[ -z "${YBA_AWS_ACCESS_KEY_ID:-}" ]]; then
+    log Create Access Keys
+    IAM_RESPONSE=$(aws iam create-access-key --user-name $PROJECT_NAME-SA)
+    export YBA_AWS_ACCESS_KEY_ID=$(echo "$IAM_RESPONSE" | jq -r '.AccessKey.AccessKeyId')
+    export YBA_AWS_SECRET_ACCESS_KEY=$(echo "$IAM_RESPONSE" | jq -r '.AccessKey.SecretAccessKey')
+    set-config YBA_AWS_ACCESS_KEY_ID $YBA_AWS_ACCESS_KEY_ID
+    set-config YBA_AWS_SECRET_ACCESS_KEY $YBA_AWS_SECRET_ACCESS_KEY
+  fi
+
+  log Setup SSH Keys
+  if [[ ! -f $PROJECT_CONFIG_DIR/$PROJECT_NAME-sshkey ]]; then
+    log Create SSH Key
+    ssh-keygen -t rsa -f $PROJECT_CONFIG_DIR/$PROJECT_NAME-sshkey -N ''
+  fi
+  log Setup AWS Key Pair
+  if [[ "0" == $(aws ec2 --region $AWS_REGION describe-key-pairs  --query "length(KeyPairs[?KeyName==\`$PROJECT_NAME\`])") ]] ; then
+    log Create AWS Key Pair
+    aws ec2 --region $AWS_REGION import-key-pair --key-name $PROJECT_NAME --public-key-material fileb://$PROJECT_CONFIG_DIR/$PROJECT_NAME-sshkey.pub
+  fi
+}
+function security-destroy(){
+  set +e
+
+  aws ec2 --region $AWS_REGION delete-key-pair --key-name $PROJECT_NAME
+
+  if [[ -n "${YBA_AWS_ACCESS_KEY_ID:-}" ]]; then
+    log "Delete access keys[$YBA_AWS_ACCESS_KEY_ID] for sa user[$PROJECT_NAME-SA]"
+    aws iam delete-access-key --user-name $PROJECT_NAME-SA --access-key-id $YBA_AWS_ACCESS_KEY_ID
+    unset YBA_AWS_ACCESS_KEY_ID
+    unset YBA_AWS_SECRET_ACCESS_KEY
+    unset-config YBA_AWS_ACCESS_KEY_ID
+    unset-config YBA_AWS_SECRET_ACCESS_KEY
+  fi
+
+  aws iam list-attached-user-policies --no-paginate --user-name $PROJECT_NAME-SA --query "AttachedPolicies[].PolicyArn" --output text | while read arn; do
+
+    if [[ $arn != None ]] ; then
+      log detach Policy[$arn] from project sa user[$PROJECT_NAME-SA]
+      aws iam detach-user-policy --user-name $PROJECT_NAME-SA --policy-arn $arn
+    fi
+  done
+
+  log "Delete sa user[$PROJECT_NAME-SA]"
+  aws iam delete-user --user-name $PROJECT_NAME-SA
+
+  YBA_IAM_POLICY_ARN=$(aws iam list-policies --scope Local --query "Policies[?PolicyName==\`$PROJECT_NAME-YBA-Policy\`].Arn|[0]" --output text)
+
+  if [[ "$YBA_IAM_POLICY_ARN" != "None" ]] ; then
+    log "Delete user policy [$YBA_IAM_POLICY_ARN]"
+    aws iam delete-policy --policy-arn $YBA_IAM_POLICY_ARN
+  fi
+
+}
+
+
+function k8s-setup(){
+  banner "Setup K8s"
+  k8s-cluster-create
+  k8s-common-services-create
+}
+function k8s-destroy(){
+  banner "Destroy K8s"
+  k8s-common-services-delete
+  k8s-cluster-delete
+}
+function k8s-cluster-create(){
+  banner "Create K8s cluster"
+  cat $K8S_CLUSTER_CONFIG| envsubst | eksctl create cluster -f-
+  k8s-kubeconfig-configure
+
+}
+function k8s-cluster-delete(){
+  banner "Delete K8s Cluster"
+  cat $K8S_CLUSTER_CONFIG| envsubst | eksctl delete cluster -f-
+}
+
+function k8s-kubeconfig-configure(){
+  kubectl config delete-context $PROJECT_NAME || true
+  kubectl config rename-context $(kubectl config current-context) $PROJECT_NAME
+}
+function k8s-common-services-create(){
+  log "Create common K8s services"
+  k8s-sc-create
+  k8s-cert-manager-create
+  k8s-ingress-create
+}
+function k8s-common-services-delete(){
+  log "Delete common K8s services"
+  k8s-ingress-delete
+  k8s-cert-manager-delete
+  k8s-sc-delete
+  k8s-pdb-delete
+}
+function k8s-pdb-delete(){
+  kubectl delete poddisruptionbudget -n kube-system ebs-csi-controller
+  kubectl delete poddisruptionbudget -n kube-system coredns
+}
+function pause(){
+   aws eks --region $AWS_REGION update-nodegroup-config --no-paginate --cluster-name $PROJECT_NAME --nodegroup-name $PROJECT_NAME-wkr-a \
+    --scaling-config minSize=0,maxSize=3,desiredSize=0
+   aws eks --region $AWS_REGION update-nodegroup-config --no-paginate --cluster-name $PROJECT_NAME --nodegroup-name $PROJECT_NAME-wkr-b \
+    --scaling-config minSize=0,maxSize=3,desiredSize=0
+   aws eks --region $AWS_REGION update-nodegroup-config --no-paginate --cluster-name $PROJECT_NAME --nodegroup-name $PROJECT_NAME-wkr-c \
+    --scaling-config minSize=0,maxSize=3,desiredSize=0
+}
+function resume(){
+   aws eks --region $AWS_REGION update-nodegroup-config --no-paginate --cluster-name $PROJECT_NAME --nodegroup-name $PROJECT_NAME-wkr-a \
+    --scaling-config minSize=0,maxSize=3,desiredSize=1
+   aws eks --region $AWS_REGION update-nodegroup-config --no-paginate --cluster-name $PROJECT_NAME --nodegroup-name $PROJECT_NAME-wkr-b \
+    --scaling-config minSize=0,maxSize=3,desiredSize=1
+   aws eks --region $AWS_REGION update-nodegroup-config --no-paginate --cluster-name $PROJECT_NAME --nodegroup-name $PROJECT_NAME-wkr-c \
+    --scaling-config minSize=0,maxSize=3,desiredSize=1
+}
+
+function k8s-sc-create(){
+  log "Create SC: gp3"
+  kubectl apply -f $PROJECT_CONFIG_DIR/gp3.yaml
+}
+function k8s-sc-delete(){
+  log "Delete SC: gp3"
+  kubectl delete -f $PROJECT_CONFIG_DIR/gp3.yaml
+}
+
+function k8s-cert-manager-create(){
+  kubectl apply -f https://github.com/cert-manager/cert-manager/releases/download/v1.13.1/cert-manager.yaml
+  kubectl wait pods -n cert-manager  -l app.kubernetes.io/component=webhook --for=condition=Ready
+  kubectl apply -f $CERT_MANAGER_CONFIG
+}
+
+function k8s-cert-manager-delete(){
+  kubectl delete -f $CERT_MANAGER_CONFIG
+  kubectl delete -f https://github.com/cert-manager/cert-manager/releases/download/v1.13.1/cert-manager.yaml
+}
+
+function k8s-ingress-create(){
+  log "Setup ingress"
+  helm repo add ingress-nginx https://kubernetes.github.io/ingress-nginx
+  helm repo update
+  helm upgrade --install  ingress-nginx -n ingress-nginx --create-namespace ingress-nginx/ingress-nginx -f $INGRESS_NGINX_HELM_VALUES
+
+  log "Wait for ingress LB address"
+  kubectl wait --for=jsonpath='{.status.loadBalancer.ingress}'  service/ingress-nginx-controller  -n ingress-nginx
+
+  INGRESS_CONTROLLER_ADDRESS=$(kubectl get service  -n ingress-nginx  ingress-nginx-controller -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+
+  DNS_CHANGE=$(cat<<EOF | jq -Mc
+  {
+    "Comment": "Update $PROJECT_DOMAIN",
+    "Changes": [
+      {
+        "Action": "UPSERT",
+        "ResourceRecordSet": {
+          "Name": "$PROJECT_DOMAIN",
+          "Type": "CNAME",
+          "TTL": 30,
+          "ResourceRecords": [
+            {
+              "Value": "$INGRESS_CONTROLLER_ADDRESS"
+            }
+          ]
+        }
+      },
+      {
+        "Action": "UPSERT",
+        "ResourceRecordSet": {
+          "Name": "*.$PROJECT_DOMAIN",
+          "Type": "CNAME",
+          "TTL": 30,
+          "ResourceRecords": [
+            {
+              "Value": "$INGRESS_CONTROLLER_ADDRESS"
+            }
+          ]
+        }
+      }
+    ]
+  }
+EOF
+  )
+  aws route53 change-resource-record-sets --hosted-zone-id $AWS_HOSTEDZONE_ID  --change-batch "$DNS_CHANGE"
+
+  log "Wait for Ingress DNS"
+  until nslookup test.$PROJECT_DOMAIN &> /dev/null
+  do
+    echo -n "."
+    sleep 10
+  done
+  log "Done"
+}
+function k8s-ingress-delete(){
+  set +e
+  INGRESS_CONTROLLER_ADDRESS=$(kubectl get service  -n ingress-nginx  ingress-nginx-controller -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+  DNS_CHANGE=$(cat<<EOF | jq -Mc
+  {
+    "Comment": "Update $PROJECT_DOMAIN",
+    "Changes": [
+      {
+        "Action": "DELETE",
+        "ResourceRecordSet": {
+          "Name": "$PROJECT_DOMAIN",
+          "Type": "CNAME",
+          "TTL": 30,
+          "ResourceRecords": [
+            {
+              "Value": "$INGRESS_CONTROLLER_ADDRESS"
+            }
+          ]
+        }
+      },
+      {
+        "Action": "DELETE",
+        "ResourceRecordSet": {
+          "Name": "*.$PROJECT_DOMAIN",
+          "Type": "CNAME",
+          "TTL": 30,
+          "ResourceRecords": [
+            {
+              "Value": "$INGRESS_CONTROLLER_ADDRESS"
+            }
+          ]
+        }
+      }
+    ]
+  }
+EOF
+  )
+  aws route53 change-resource-record-sets --hosted-zone-id $AWS_HOSTEDZONE_ID  --change-batch "$DNS_CHANGE"
+
+  helm delete ingress-nginx -n ingress-nginx
+}
+
+function yba-setup(){
+  yba-install
+  yba-user-register
+  source $PROJECT_ENV_FILE
+  yba-cloud-configure
+  yba-backup-configure
+  yba-kms-configure
+  yba-info
+}
+function yba-destroy(){
+  yba-user-unregister
+  yba-uninstall
+
+}
+
+function yba-install(){
+  banner "Install YBA"
+  log "Create NS"
+  kubectl create ns $YBA_NS || echo "NS($YBA_NS) exists"
+
+  log "Setup license"
+  kubectl apply -n $YBA_NS -f $YBA_LICENSE
+
+  log "Setup Helm"
+  helm repo add yugabytedb https://charts.yugabyte.com
+  helm repo add ealenn https://ealenn.github.io/charts
+  helm repo add jetstack https://charts.jetstack.io
+  helm repo update
+
+  log "Install YBA"
+  helm upgrade --install \
+    $YBA_HELM_RELEASE yugabytedb/yugaware \
+    -n $YBA_NS \
+    --version $YBA_HELM_VERSION \
+    -f $YBA_HELM_VALUES \
+    --set "yugaware.additionAllowedCorsOrigins={https://$YBA_HOSTNAME,http://$YBA_HOSTNAME}" \
+    --wait
+
+  cat $PROJECT_CONFIG_DIR/yba-ingress.template.yaml | envsubst | kubectl apply -n $YBA_NS -f-
+
+  log "Wait for pods to be ready"
+  kubectl wait --timeout=60s --for=condition=Ready pods  -l app=$YBA_HELM_RELEASE-yugaware -n $YBA_NS
+
+  log "Wait for ingress to be configured with LB"
+  kubectl wait --timeout=120s --for=jsonpath='{.status.loadBalancer.ingress}'  ingress/$YBA_HELM_RELEASE  -n yb-platform
+
+  log "Wait for YBA API to be ready"
+  until  curl -m1 -fksSL $YBA_API/app_version &>> /dev/null
+  do
+    echo -n "."
+    sleep 5
+  done
+  log "Done"
+
+}
+function yba-uninstall(){
+  set +e
+  log Remove ingress
+  cat $PROJECT_CONFIG_DIR/yba-ingress.template.yaml | envsubst | kubectl delete -n $YBA_NS -f-
+
+  log Uninstall YBA
+  helm delete $YBA_HELM_RELEASE -n $YBA_NS
+
+  log Delete YBA License
+  kubectl delete -n $YBA_NS -f $YBA_LICENSE
+
+  log Delete YBA Namespace
+  kubectl delete ns $YBA_NS
+}
+
+function yba-user-register(){
+  log "YBA Register user"
+
+  REGISTER_REQUEST_JSON=$(cat <<-EOF | jq -cM
+{
+  "code": "demo",
+  "name": "Super Admin",
+  "email": "$YBA_USERNAME",
+  "password": "$YBA_PASSWORD",
+  "confirmPassword":"$YBA_PASSWORD",
+  "confirmEULA": true
+}
+EOF
+  )
+
+  if [[ $(curl $YBA_API/customer_count -ksSL | jq '.count') -eq 0 ]]
+  then
+    log "Registering User"
+    REGISTER_RESPONSE_JSON=$(curl $YBA_API/register?generateApiToken=true \
+      -ksSL \
+      -H 'Accept: application/json' \
+      -H 'Content-Type: application/json;charset=UTF-8' \
+      -X POST \
+      -d "$REGISTER_REQUEST_JSON"
+    )
+    YBA_API_TOKEN=$(echo $REGISTER_RESPONSE_JSON | jq -rcM '.apiToken')
+    YBA_CUSTOMER_UUID=$(echo $REGISTER_RESPONSE_JSON | jq -rcM '.customerUUID')
+    YBA_USER_UUID=$(echo $REGISTER_RESPONSE_JSON | jq -rcM '.userUUID')
+    YBA_AUTH_HEADER=X-AUTH-YW-API-TOKEN:$YBA_API_TOKEN
+  else
+    log "Skipping registration"
+    YBA_AUTH_TOKEN=$(curl $YBA_API/login \
+      -ksSL \
+      -H 'Accept: application/json' \
+      -H 'Content-Type: application/json;charset=UTF-8' \
+      -X POST \
+      -d "{\"email\":\"$YBA_USERNAME\",\"password\":\"$YBA_PASSWORD\"}"  \
+      | jq -r '.authToken'
+    )
+
+    SESSION_INFO_RESPONSE_JSON=$(curl $YBA_API/session_info \
+      -ksSL \
+      -H 'Accept: application/json' \
+      -H 'Content-Type: application/json;charset=UTF-8' \
+      -H "X-AUTH-TOKEN:$YBA_AUTH_TOKEN"
+    )
+
+    YBA_API_TOKEN=$(echo $SESSION_INFO_RESPONSE_JSON | jq -rcM '.apiToken')
+    YBA_CUSTOMER_UUID=$(echo $SESSION_INFO_RESPONSE_JSON | jq -rcM '.customerUUID')
+    YBA_USER_UUID=$(echo $SESSION_INFO_RESPONSE_JSON | jq -rcM '.userUUID')
+    YBA_AUTH_HEADER=X-AUTH-YW-API-TOKEN:$YBA_API_TOKEN
+  fi
+  set-config YBA_HOSTNAME $YBA_HOSTNAME
+  set-config YBA_PORTAL $YBA_PORTAL
+  set-config YBA_API $YBA_API
+  set-config YBA_API_TOKEN $YBA_API_TOKEN
+  set-config YBA_CUSTOMER_UUID $YBA_CUSTOMER_UUID
+  set-config YBA_CUSTOMER_API $YBA_API/customers/$YBA_CUSTOMER_UUID
+  set-config YBA_USER_UUID $YBA_USER_UUID
+  set-config YBA_AUTH_HEADER $YBA_AUTH_HEADER
+  export YBA_HOSTNAME YBA_PORTAL YBA_API YBA_API_TOKEN YBA_CUSTOMER_UUID YBA_CUSTOMER_API YBA_USER_UUID YBA_AUTH_HEADER
+  log "User registration done"
+}
+function yba-user-unregister(){
+  log "Cleanup User config"
+  unset-config YBA_HOSTNAME
+  unset-config YBA_PORTAL
+  unset-config YBA_API
+  unset-config YBA_API_TOKEN
+  unset-config YBA_CUSTOMER_UUID
+  unset-config YBA_CUSTOMER_API
+  unset-config YBA_USER_UUID
+  unset-config YBA_AUTH_HEADER
+}
+function yba-cloud-configure(){
+  log "YBA Configure cloud"
+  YBA_K8S_PROVIDER_REQUEST_JSON=$(cat <<EOF | jq -cM
+  {
+    "code": "kubernetes",
+    "name": "$YBA_K8S_PROVIDER_NAME",
+    "details": {
+      "airGapInstall": true,
+      "cloudInfo": {
+        "kubernetes": {
+          "kubernetesImageRegistry": "quay.io/yugabyte/yugabyte",
+          "kubernetesProvider": "eks",
+          "kubernetesPullSecretContent": $YBA_LICENSE_VALUE,
+          "kubernetesPullSecretName": "yugabyte-k8s-pull-secret",
+          "kubernetesImagePullSecretName": "yugabyte-k8s-pull-secret"
+        }
+      }
+    },
+    "regions": [
+      {
+        "code": "ap-southeast-1",
+        "name": "Asia Pacific (Singapore)",
+        "zones": [
+          {
+            "code": "ap-southeast-1a",
+            "name": "ap-southeast-1a",
+            "details": {
+              "cloudInfo": {
+                "kubernetes": {
+                  "kubernetesStorageClass": "$YBA_K8S_STORAGECLASS"
+                }
+              }
+            }
+          },
+          {
+            "code": "ap-southeast-1c",
+            "name": "ap-southeast-1c",
+            "details": {
+              "cloudInfo": {
+                "kubernetes": {
+                  "kubernetesStorageClass": "$YBA_K8S_STORAGECLASS"
+                }
+              }
+            }
+          },
+          {
+            "code": "ap-southeast-1b",
+            "name": "ap-southeast-1b",
+            "details": {
+              "cloudInfo": {
+                "kubernetes": {
+                  "kubernetesStorageClass": "$YBA_K8S_STORAGECLASS"
+                }
+              }
+            }
+          }
+        ],
+        "details": {
+          "cloudInfo": {
+            "kubernetes": {}
+          }
+        }
+      }
+    ]
+  }
+EOF
+  )
+  YBA_K8S_PROVIDER_RESPONSE_JSON=$(curl $YBA_CUSTOMER_API/providers?validate=false \
+    -ksSL \
+    -H 'Accept: application/json' \
+    -H 'Content-Type: application/json;charset=UTF-8' \
+    -H $YBA_AUTH_HEADER \
+    --data-raw "$YBA_K8S_PROVIDER_REQUEST_JSON" \
+    --compressed
+  )
+  # YBA_K8S_PROVIDER_UUID=$(echo "$YBA_K8S_PROVIDER_RESPONSE_JSON" | jq -r '.resourceUUID' )
+}
+
+function yba-backup-configure(){
+  log "Config Backup"
+  YBA_BACKUP_CONFIG_REQUEST=$(cat <<EOF | jq -cM
+  {
+    "configName": "aws-s3",
+    "data": {
+      "BACKUP_LOCATION": "s3://$YBA_BACKUP_BUCKET",
+      "IAM_INSTANCE_PROFILE": "false",
+      "AWS_ACCESS_KEY_ID": "$YBA_AWS_ACCESS_KEY_ID",
+      "AWS_SECRET_ACCESS_KEY": "$YBA_AWS_SECRET_ACCESS_KEY"
+    },
+    "name": "S3",
+    "type": "STORAGE"
+  }
+EOF
+  )
+  YBA_BACKUP_CONFIG_RESPONSE_JSON=$(curl $YBA_CUSTOMER_API/configs \
+    -ksSL \
+    -H 'Accept: application/json' \
+    -H 'Content-Type: application/json;charset=UTF-8' \
+    -H $YBA_AUTH_HEADER \
+    --data-raw "$YBA_BACKUP_CONFIG_REQUEST" \
+    --compressed
+  )
+}
+
+function yba-kms-configure(){
+  log "Config KMS"
+  YBA_KMS_CONFIG_REQUEST=$(cat <<EOF | jq -cM
+  {
+    "name":"aws-kms",
+    "AWS_ACCESS_KEY_ID": "$YBA_AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY": "$YBA_AWS_SECRET_ACCESS_KEY",
+    "AWS_REGION":"ap-southeast-1"
+  }
+EOF
+  )
+
+  YBA_KMS_CONFIG_RESPONSE_JSON=$(curl $YBA_CUSTOMER_API/kms_configs/AWS \
+    -ksSL \
+    -H 'Accept: application/json' \
+    -H 'Content-Type: application/json;charset=UTF-8' \
+    -H $YBA_AUTH_HEADER \
+    --data-raw "$YBA_KMS_CONFIG_REQUEST" \
+    --compressed
+  )
+}
+
+
+function yba-db-create(){
+  banner "Create DB"
+  yba-universe-create db1 $YBA_K8S_PROVIDER_NAME
+  wls-deploy db1
+}
+function yba-db-delete(){
+  banner "Delete DB"
+  wls-undeploy db1
+  yba-universe-delete db1
+}
+function yba-universe-create(){
+  export DB_NAME=$1;shift
+  export PROVIDER_NAME=$1;shift
+  export YB_VERSION=${YB_VERSION:-$YBA_VERSION}
+  log "$DB_NAME: Create universe P: $PROVIDER_NAME V: $YB_VERSION"
+  PROVIDER=$(curl $YBA_CUSTOMER_API/providers?name=$PROVIDER_NAME \
+    -ksSL \
+    -H 'Accept: application/json'  \
+    -H 'Content-Type: application/json;charset=UTF-8' \
+    -H $YBA_AUTH_HEADER \
+    | jq '.[0]'
+  )
+  export YB_VERSION=$YBA_VERSION
+  export INSTANCE_TYPE="xsmall"
+  export UNIVERSE_UUID="$(uuidgen)"
+  export CLUSTER_UUID="$(uuidgen)"
+  export PROVIDER_UUID="$(echo "$PROVIDER" | jq  -r '.uuid')"
+  export PROVIDER_TYPE="$(echo "$PROVIDER" | jq -r '.code')"
+  export REGION_UUID="$(echo "$PROVIDER" | jq -r '.regions[0].uuid')"
+  export REGION_CODE="$(echo "$PROVIDER" | jq -r '.regions[0].code')"
+  export REGION_NAME="$(echo "$PROVIDER" | jq -r '.regions[0].name')"
+  export AZ1_UUID="$(echo "$PROVIDER" | jq -r '.regions[0].zones[0].uuid')"
+  export AZ1_CODE="$(echo "$PROVIDER" | jq -r '.regions[0].zones[0].code')"
+  export AZ1_NAME="$(echo "$PROVIDER" | jq -r '.regions[0].zones[0].name')"
+  export AZ1_SC="$(echo "$PROVIDER" | jq -r '.regions[0].zones[0].details.cloudInfo.kubernetes.kubernetesStorageClass')"
+  export AZ2_UUID="$(echo "$PROVIDER" | jq -r '.regions[0].zones[1].uuid')"
+  export AZ2_CODE="$(echo "$PROVIDER" | jq -r '.regions[0].zones[1].code')"
+  export AZ2_NAME="$(echo "$PROVIDER" | jq -r '.regions[0].zones[1].name')"
+  export AZ2_SC="$(echo "$PROVIDER" | jq -r '.regions[0].zones[1].details.cloudInfo.kubernetes.kubernetesStorageClass')"
+  export AZ3_UUID="$(echo "$PROVIDER" | jq -r '.regions[0].zones[2].uuid')"
+  export AZ3_CODE="$(echo "$PROVIDER" | jq -r '.regions[0].zones[2].code')"
+  export AZ3_NAME="$(echo "$PROVIDER" | jq -r '.regions[0].zones[2].name')"
+  export AZ3_SC="$(echo "$PROVIDER" | jq -r '.regions[0].zones[2].details.cloudInfo.kubernetes.kubernetesStorageClass')"
+  export NOW="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+  UNIVERSE_CREATE_REQUEST=$(cat $PROJECT_CONFIG_DIR/universe.template.json | envsubst)
+
+  UNIVERSE_CREATE_RESPONSE=$(curl $YBA_CUSTOMER_API/universes \
+    -ksSL \
+    -H 'Accept: application/json'  \
+    -H 'Content-Type: application/json;charset=UTF-8' \
+    -H $YBA_AUTH_HEADER \
+    -X POST \
+    --data-raw "$UNIVERSE_CREATE_REQUEST"
+  )
+  TASK_UUID=$(echo "$UNIVERSE_CREATE_RESPONSE" | jq -r '.taskUUID')
+  yba-task-wait $TASK_UUID
+  log "$DB_NAME: Universe Created"
+}
+
+function yba-universe-delete(){
+  export DB_NAME=$1;shift
+  log "$DB_NAME: Delete Universe"
+  UNIVERSE_UUID=$(curl $YBA_CUSTOMER_API/universes?name=$DB_NAME \
+    -ksSL \
+    -H 'Accept: application/json'  \
+    -H 'Content-Type: application/json;charset=UTF-8' \
+    -H $YBA_AUTH_HEADER \
+    | jq  -r ".[].universeUUID"
+  )
+  if [[ -z $UNIVERSE_UUID ]]; then
+    log "$DB_NAME: Not found"
+    return
+  fi
+
+  UNIVERSE_DELETE_RESPONSE=$(curl $YBA_CUSTOMER_API/universes/$UNIVERSE_UUID \
+    -ksSL \
+    -H 'Accept: application/json'  \
+    -H 'Content-Type: application/json;charset=UTF-8' \
+    -H $YBA_AUTH_HEADER \
+    -X DELETE
+  )
+  TASK_UUID=$(echo "$UNIVERSE_DELETE_RESPONSE" | jq -r '.taskUUID')
+  yba-task-wait $TASK_UUID
+  log "$DB_NAME: Universe Deleted"
+}
+function wls-deploy(){
+  db=${1?"DB Name missing"}
+  tservers=$(universe-tservers $db)
+  export DB_NAME=$db
+  export WLS_HOSTNAME=$DB_NAME-wls.$PROJECT_DOMAIN
+  export SERVER_NAME=$(echo "$tservers" | head -1 | cut -f1 -d:)
+  export ADDITIONAL_ENDPOINTS=$(echo "$tservers" | tail -n +2 | tr '\n' ','|sed 's/,$//')
+  log "
+  DB_NAME              = [$DB_NAME]
+  WLS_HOSTNAME         = [$WLS_HOSTNAME]
+  SERVER_NAME          = [$SERVER_NAME]
+  ADDITIONAL_ENDPOINTS = [$ADDITIONAL_ENDPOINTS]"
+  cat $PROJECT_CONFIG_DIR/wls.yaml | envsubst | kubectl apply -n yb-platform -f-
+  kubectl wait --timeout=120s --for=jsonpath='{.status.loadBalancer.ingress}'  ingress/$DB_NAME-wls  -n yb-platform
+  wls_hostname=$(kubectl get -n yb-platform ing/$DB_NAME-wls -o jsonpath='{.spec.rules[0].host}')
+  log "WLS: https://$wls_hostname"
+}
+function wls-undeploy(){
+  db=${1?"DB Missing"}
+  export DB_NAME=$db
+  export WLS_HOSTNAME=$DB_NAME-wls.$PROJECT_DOMAIN
+  cat $PROJECT_CONFIG_DIR/wls.yaml | envsubst | kubectl delete -n yb-platform -f-
+}
+function yba-task-wait(){
+  TASK_UUID=$1;shift
+  while true;
+  do
+    TASK_RESPONSE=$(curl $YBA_CUSTOMER_API/tasks/$TASK_UUID \
+      -ksSL \
+      -H 'Accept: application/json'  \
+      -H 'Content-Type: application/json;charset=UTF-8' \
+      -H $YBA_AUTH_HEADER \
+      -X GET
+    )
+    TASK_STATUS=$(echo "$TASK_RESPONSE" | jq -r '.status')
+    TASK_PERCENT=$(echo "$TASK_RESPONSE" | jq -r '.percent|round')
+    TASK_TITLE=$(echo "$TASK_RESPONSE" | jq -r '.title')
+    log "TASK: [$TASK_UUID][$TASK_STATUS][$TASK_PERCENT%] $TASK_TITLE"
+
+    if [[ $TASK_STATUS != "Running" ]] ; then break ; fi
+    sleep 5
+  done
+}
+function universe-tservers(){
+  universe_name=${1?"Universe name missing"}
+  universe_uuid=$(
+    curl $YBA_CUSTOMER_API/universes?name=$universe_name\
+      -ksSL \
+      -H 'Accept: application/json'  \
+      -H 'Content-Type: application/json;charset=UTF-8' \
+      -H $YBA_AUTH_HEADER \
+      -X GET  \
+      | jq -r '.[0].universeUUID'
+  )
+  curl $YBA_CUSTOMER_API/universes/$universe_uuid/ysqlservers\
+      -ksSL \
+      -H 'Accept: application/json'  \
+      -H 'Content-Type: application/json;charset=UTF-8' \
+      -H $YBA_AUTH_HEADER \
+      -X GET |
+      jq -r |
+      tr ',' '\n'
+
+}
+# function set-config(){
+#   key=$1;shift
+#   value="$@"; shift
+#   [[ -f $PROJECT_ENV_FILE ]]  || touch $PROJECT_ENV_FILE
+#   config=$(cat $PROJECT_ENV_FILE)
+#   config="$(echo "$config" | grep -v "export $key=" | sort)"
+#   if [[ -n $value ]]; then
+#   cat <<EOF | sort > $PROJECT_ENV_FILE
+# $config
+# export $key="$value"
+# EOF
+#   else
+#   cat <<EOF | sort > $PROJECT_ENV_FILE
+# $config
+# EOF
+#   fi
+# }
+# function unset-config(){
+#   key=$1;shift
+#   set-config $key ""
+# }
+function yba-info(){
+  cat <<EOF
+Summary
+===============
+
+Portal        : ${YBA_PORTAL-}
+API           : ${YBA_API-}
+Customer UUID : ${YBA_CUSTOMER_UUID-}
+User UUID     : ${YBA_USER_UUID-}
+API Token     : ${YBA_API_TOKEN-}
+Username      : ${YBA_USERNAME-}
+Password      : ${YBA_PASSWORD-}
+
+
+Sample API Call
+===============
+
+curl \\
+  -ksSL \\
+  -H 'Accept: application/json' \\
+  -H 'Content-Type: application/json;charset=UTF-8' \\
+  -H '${YBA_AUTH_HEADER-}' \\
+  ${YBA_API-}/session_info
+
+EOF
+}
+
+# function log(){
+#   echo $(date +"[%Y-%m-%d %H:%m:%S]") "$@"
+# }
+
+# function banner(){
+#   cat <<EOF
+# ========================================================================
+# $@
+# ========================================================================
+# EOF
+# }
+
+op=$1; shift
+$op "$@"
